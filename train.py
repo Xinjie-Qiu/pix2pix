@@ -26,6 +26,10 @@ import torch.utils.data as data
 from torch import optim
 import os
 
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# The GPU id to use, usually either "0" or "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 
 nModules = 2
 nFeats = 256
@@ -36,7 +40,7 @@ nOutChannels_0 = 2
 nOutChannels_1 = nSkeleton + 1
 nOutChannels_2 = nKeypoint
 epochs = 51
-batch_size = 16
+batch_size = 32
 keypoints = 17
 skeleton = 20
 low_level_chennel = 48
@@ -436,9 +440,9 @@ class NLayerDiscriminator(nn.Module):
 
 
 if __name__ == '__main__':
-    writer = SummaryWriter('run\\' + save_model_name)
-    anno = r'D:\COCO2017\annotations_trainval2017\annotations\person_keypoints_train2017.json'
-    image_dir = r'D:\COCO2017\train2017'
+    writer = SummaryWriter('run/' + save_model_name)
+    anno = '/data/COCO/COCO2017/annotations_trainval2017/annotations/person_keypoints_train2017.json'
+    image_dir = '/data/COCO/COCO2017/train2017'
     mytransform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
