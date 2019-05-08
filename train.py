@@ -39,7 +39,7 @@ nSkeleton = 19
 nOutChannels_0 = 2
 nOutChannels_1 = nSkeleton + 1
 nOutChannels_2 = nKeypoint
-epochs = 51
+epochs = 100
 batch_size = 32
 keypoints = 17
 skeleton = 20
@@ -51,6 +51,8 @@ threshold = 0.8
 
 save_model_name = 'params_1.pkl'
 load_model_name = 'params_1.pkl'
+
+mode = 'test'
 
 class Rescale(object):
     """Rescale the image in a sample to a given size.
@@ -289,7 +291,7 @@ class myImageDataset_COCO(data.Dataset):
         # print('esf')
         cm = ScalarMappable()
 
-        image_after = self.transform(sample['image'])
+        image_after = self.transform(sample['image'] / 255)
 
         cm.set_array(np.array(Label_map_skeleton))
         result = cm.to_rgba(np.array(Label_map_skeleton.resize([256, 256])))[:, :, :3].swapaxes(0, 2)
@@ -363,7 +365,7 @@ class UnetSkipConnectionBlock(nn.Module):
                                         kernel_size=4, stride=2,
                                         padding=1)
             down = [downconv]
-            up = [uprelu, upconv, nn.Tanh()]
+            up = [uprelu, upconv, nn.Sigmoid()]
             model = down + [submodule] + up
         elif innermost:
             upconv = nn.ConvTranspose2d(inner_nc, outer_nc,
@@ -440,86 +442,104 @@ class NLayerDiscriminator(nn.Module):
 
 
 if __name__ == '__main__':
-    writer = SummaryWriter('run/' + save_model_name)
-    anno = '/data/COCO/COCO2017/annotations_trainval2017/annotations/person_keypoints_train2017.json'
-    image_dir = '/data/COCO/COCO2017/train2017'
-    mytransform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    ])
-    loss = nn.MSELoss().cuda()
-    loss_L1 = nn.L1Loss().cuda()
-    netG = UnetGenerator(3, 3, 8, 64, norm_layer=nn.BatchNorm2d, use_dropout=False).cuda()
-    netD = NLayerDiscriminator(6, 64, n_layers=3, norm_layer=nn.BatchNorm2d).cuda()
-    optD = optim.Adam(netD.parameters(), lr=1e-4)
-    optG = optim.Adam(netG.parameters(), lr=1e-4)
-    train_image_dataloader = data.DataLoader(myImageDataset_COCO(anno, image_dir, transform=mytransform), batch_size, shuffle=True, num_workers=8)
-    if not os.path.isfile(load_model_name):
-        epoch = 0
-    else:
+    if mode == 'train':
+        writer = SummaryWriter('run/' + save_model_name)
+        anno = '/data/COCO/COCO2017/annotations_trainval2017/annotations/person_keypoints_train2017.json'
+        image_dir = '/data/COCO/COCO2017/train2017'
+        mytransform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        loss = nn.MSELoss().cuda()
+        loss_L1 = nn.L1Loss().cuda()
+        netG = UnetGenerator(3, 3, 8, 64, norm_layer=nn.BatchNorm2d, use_dropout=False).cuda()
+        netD = NLayerDiscriminator(6, 64, n_layers=3, norm_layer=nn.BatchNorm2d).cuda()
+        optD = optim.Adam(netD.parameters(), lr=1e-4)
+        optG = optim.Adam(netG.parameters(), lr=1e-4)
+        train_image_dataloader = data.DataLoader(myImageDataset_COCO(anno, image_dir, transform=mytransform), batch_size, shuffle=True, num_workers=8)
+        if not os.path.isfile(load_model_name):
+            epoch = 0
+        else:
+            state = torch.load(load_model_name)
+            netG.load_state_dict(state['state_dict_G'])
+            netD.load_state_dict(state['state_dict_D'])
+            optG.load_state_dict(state['optimizer_G'])
+            optD.load_state_dict(state['optimizer_D'])
+            epoch = state['epoch']
+        while epoch <= epochs:
+            for i, [x_, y_skeleton] in enumerate(train_image_dataloader, 0):
+                real_B, real_A = x_.cuda(), y_skeleton.cuda()
+                fake_B = netG(real_A)
+
+
+                optD.zero_grad()
+                for p in netD.parameters():
+                    p.requires_grad = True
+                fake_AB = torch.cat([real_A, fake_B], dim=1)
+                pred_fake = netD(fake_AB)
+                fake_label = torch.Tensor([0]).cuda()
+                fake_label = fake_label.expand_as(pred_fake)
+                loss_D_fake = loss(pred_fake, fake_label)
+
+                real_AB = torch.cat([real_A, real_B], dim=1)
+                pred_real = netD(real_AB)
+                real_label = torch.Tensor([1]).cuda()
+                real_label = real_label.expand_as(pred_fake)
+                loss_D_real = loss(pred_real, real_label)
+
+                loss_D = (loss_D_fake + loss_D_real) * 0.5
+                loss_D.backward(retain_graph=True)
+                optD.step()
+
+                optG.zero_grad()
+                for p in netD.parameters():
+                    p.requires_grad = False
+                fake_AB = torch.cat([real_A, fake_B], dim=1)
+                pred_fake = netD(fake_AB)
+                real_label = torch.Tensor([1]).cuda()
+                real_label = real_label.expand_as(pred_fake)
+                loss_G_GAN = loss(pred_fake, real_label)
+                loss_G_L1 = loss_L1(fake_B, real_B)
+                loss_G = loss_G_GAN + loss_G_L1
+                loss_G.backward()
+                optG.step()
+                if i % 50 == 0:
+                    steps = i + len(train_image_dataloader) * epoch
+                    writer.add_scalar('loss_G', loss_G, steps)
+                    writer.add_scalar('loss_D', loss_D, steps)
+                    print('[{}/{}][{}/{}] LossG: {} Loss_D: {}'.format(
+                        epoch, epochs, i, len(train_image_dataloader), loss_G, loss_D))
+            epoch += 1
+            state = {
+                'epoch': epoch,
+                'state_dict_G': netG.state_dict(),
+                'state_dict_D': netD.state_dict(),
+                'optimizer_G': optG.state_dict(),
+                'optimizer_D': optD.state_dict(),
+            }
+            torch.save(state, save_model_name)
+
+        x = torch.rand([4, 3, 256, 256]).cuda()
+
+        fake = netG.forward(x)
+        result = torch.cat([x, fake], dim=1)
+        result = netD(result)
+
+        print('efsdf')
+    elif mode == 'test':
+        netG = UnetGenerator(3, 3, 8, 64, norm_layer=nn.BatchNorm2d, use_dropout=False).eval().half().cuda()
+        anno = '/data/COCO/COCO2017/annotations_trainval2017/annotations/person_keypoints_train2017.json'
+        image_dir = '/data/COCO/COCO2017/train2017'
+        mytransform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        ])
         state = torch.load(load_model_name)
         netG.load_state_dict(state['state_dict_G'])
-        netD.load_state_dict(state['state_dict_D'])
-        optG.load_state_dict(state['optimizer_G'])
-        optD.load_state_dict(state['optimizer_D'])
-        epoch = state['epoch']
-    while epoch <= epochs:
+        train_image_dataloader = data.DataLoader(myImageDataset_COCO(anno, image_dir, transform=mytransform),
+                                                 1, shuffle=True, num_workers=1)
         for i, [x_, y_skeleton] in enumerate(train_image_dataloader, 0):
-            real_B, real_A = x_.cuda(), y_skeleton.cuda()
+            real_B, real_A = x_.cuda().half(), y_skeleton.cuda().half()
             fake_B = netG(real_A)
-
-
-            optD.zero_grad()
-            for p in netD.parameters():
-                p.requires_grad = True
-            fake_AB = torch.cat([real_A, fake_B], dim=1)
-            pred_fake = netD(fake_AB)
-            fake_label = torch.Tensor([0]).cuda()
-            fake_label = fake_label.expand_as(pred_fake)
-            loss_D_fake = loss(pred_fake, fake_label)
-
-            real_AB = torch.cat([real_A, real_B], dim=1)
-            pred_real = netD(real_AB)
-            real_label = torch.Tensor([1]).cuda()
-            real_label = real_label.expand_as(pred_fake)
-            loss_D_real = loss(pred_real, real_label)
-
-            loss_D = (loss_D_fake + loss_D_real) * 0.5
-            loss_D.backward(retain_graph=True)
-            optD.step()
-
-            optG.zero_grad()
-            for p in netD.parameters():
-                p.requires_grad = False
-            fake_AB = torch.cat([real_A, fake_B], dim=1)
-            pred_fake = netD(fake_AB)
-            real_label = torch.Tensor([1]).cuda()
-            real_label = real_label.expand_as(pred_fake)
-            loss_G_GAN = loss(pred_fake, real_label)
-            loss_G_L1 = loss_L1(fake_B, real_B)
-            loss_G = loss_G_GAN + loss_G_L1
-            loss_G.backward()
-            optG.step()
-            if i % 50 == 0:
-                steps = i + len(train_image_dataloader) * epoch
-                writer.add_scalar('loss_G', loss_G, steps)
-                writer.add_scalar('loss_D', loss_D, steps)
-                print('[{}/{}][{}/{}] LossG: {} Loss_D: {}'.format(
-                    epoch, epochs, i, len(train_image_dataloader), loss_G, loss_D))
-        epoch += 1
-        state = {
-            'epoch': epoch,
-            'state_dict_G': netG.state_dict(),
-            'state_dict_D': netD.state_dict(),
-            'optimizer_G': optG.state_dict(),
-            'optimizer_D': optD.state_dict(),
-        }
-        torch.save(state, save_model_name)
-
-    x = torch.rand([4, 3, 256, 256]).cuda()
-
-    fake = netG.forward(x)
-    result = torch.cat([x, fake], dim=1)
-    result = netD(result)
-
-    print('efsdf')
+            plt.imshow(transforms.ToPILImage()(fake_B.cpu().float()[0]))
+            plt.show()
+            print('efs')
