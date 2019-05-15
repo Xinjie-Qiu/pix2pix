@@ -39,8 +39,8 @@ nSkeleton = 19
 nOutChannels_0 = 2
 nOutChannels_1 = nSkeleton + 1
 nOutChannels_2 = nKeypoint
-epochs = 100
-batch_size = 32
+epochs = 1000
+batch_size = 64
 keypoints = 17
 skeleton = 20
 low_level_chennel = 48
@@ -49,10 +49,10 @@ inputsize = 256
 
 threshold = 0.8
 
-save_model_name = 'params_1.pkl'
-load_model_name = 'params_1.pkl'
+save_model_name = 'params_2.pkl'
+load_model_name = 'params_2.pkl'
 
-mode = 'test'
+mode = 'train'
 
 class Rescale(object):
     """Rescale the image in a sample to a given size.
@@ -291,11 +291,11 @@ class myImageDataset_COCO(data.Dataset):
         # print('esf')
         cm = ScalarMappable()
 
-        image_after = self.transform(sample['image'] / 255)
+        image_after = self.transform(np.array(sample['image']) / 255)
 
         cm.set_array(np.array(Label_map_skeleton))
         result = cm.to_rgba(np.array(Label_map_skeleton.resize([256, 256])))[:, :, :3].swapaxes(0, 2)
-        return image_after, torch.Tensor(result)
+        return image_after.float(), torch.Tensor(result).float()
 
 
 class UnetGenerator(nn.Module):
@@ -455,6 +455,10 @@ if __name__ == '__main__':
         netD = NLayerDiscriminator(6, 64, n_layers=3, norm_layer=nn.BatchNorm2d).cuda()
         optD = optim.Adam(netD.parameters(), lr=1e-4)
         optG = optim.Adam(netG.parameters(), lr=1e-4)
+        netG, optG = amp.initialize(netG, optG, opt_level="O1")
+        netD, optD = amp.initialize(netD, optD, opt_level='O1')
+        netG.train()
+        netD.train()
         train_image_dataloader = data.DataLoader(myImageDataset_COCO(anno, image_dir, transform=mytransform), batch_size, shuffle=True, num_workers=8)
         if not os.path.isfile(load_model_name):
             epoch = 0
@@ -487,7 +491,9 @@ if __name__ == '__main__':
                 loss_D_real = loss(pred_real, real_label)
 
                 loss_D = (loss_D_fake + loss_D_real) * 0.5
-                loss_D.backward(retain_graph=True)
+                with amp.scale_loss(loss_D, optD) as scaled_loss:
+                    scaled_loss.backward(retain_graph=True)
+                # loss_D.backward(retain_graph=True)
                 optD.step()
 
                 optG.zero_grad()
@@ -500,7 +506,8 @@ if __name__ == '__main__':
                 loss_G_GAN = loss(pred_fake, real_label)
                 loss_G_L1 = loss_L1(fake_B, real_B)
                 loss_G = loss_G_GAN + loss_G_L1
-                loss_G.backward()
+                with amp.scale_loss(loss_G, optG) as scaled_loss:
+                    scaled_loss.backward()
                 optG.step()
                 if i % 50 == 0:
                     steps = i + len(train_image_dataloader) * epoch
@@ -508,6 +515,10 @@ if __name__ == '__main__':
                     writer.add_scalar('loss_D', loss_D, steps)
                     print('[{}/{}][{}/{}] LossG: {} Loss_D: {}'.format(
                         epoch, epochs, i, len(train_image_dataloader), loss_G, loss_D))
+                if i % 100 == 0:
+                    steps = i + len(train_image_dataloader) * epoch
+                    image = torchvision.utils.make_grid(fake_B, normalize=True, range=(0, 1))
+                    writer.add_image('fake_B', image, steps)
             epoch += 1
             state = {
                 'epoch': epoch,
@@ -530,8 +541,7 @@ if __name__ == '__main__':
         anno = '/data/COCO/COCO2017/annotations_trainval2017/annotations/person_keypoints_train2017.json'
         image_dir = '/data/COCO/COCO2017/train2017'
         mytransform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+            transforms.ToTensor()
         ])
         state = torch.load(load_model_name)
         netG.load_state_dict(state['state_dict_G'])
